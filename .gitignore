@@ -1,0 +1,12 @@
+### Secretos y configuración local (nunca al repositorio) ###
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+### Editores y sistema operativo ###
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

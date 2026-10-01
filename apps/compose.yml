@@ -1,0 +1,92 @@
+# GymFlow en la EC2 ec2-apps. Construye los 3 servicios desde los repos clonados al lado de infra/:
+#   ~/gymflow/infra/apps/compose.yml  →  ../../ms-gymflow-bff, ../../ms-gymflow-catalog, ../../ms-gymflow-reservations
+#
+# - Solo el BFF publica un puerto (8080). catalog y reservations quedan en la red interna "gymflow":
+#   desde internet no se llega a ellos; el BFF los llama por el nombre del servicio.
+# - Las variables salen de apps/.env (ignorado por git). Las obligatorias usan ${VAR:?mensaje}:
+#   si faltan, "docker compose up" se detiene con ese mensaje en vez de arrancar mal configurado.
+# - Cada contenedor tiene un límite de 512 MB. La JVM respeta el límite del contenedor y se le da el 70 %
+#   para el heap (~360 MB); el resto queda para metaspace, hilos y buffers.
+
+name: gymflow
+
+x-java: &java
+  restart: unless-stopped
+  mem_limit: 512m
+  networks: [gymflow]
+  environment: &java-env
+    JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=70 -XX:+ExitOnOutOfMemoryError"
+    TZ: UTC
+
+# Healthcheck sin curl: la imagen eclipse-temurin trae bash, que puede abrir una conexión TCP con /dev/tcp.
+# Se pide /actuator/health y se busca "UP". En catalog y reservations ese health incluye la conexión a RDS,
+# así que "healthy" significa "la app arrancó y llega a la base de datos".
+x-health: &health
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 90s
+
+services:
+  ms-gymflow-catalog:
+    <<: *java
+    build: ../../ms-gymflow-catalog
+    image: gymflow/ms-gymflow-catalog:latest
+    container_name: ms-gymflow-catalog
+    environment:
+      <<: *java-env
+      DB_URL: ${DB_URL:?Falta DB_URL en .env}
+      DB_USERNAME: ${DB_USERNAME:?Falta DB_USERNAME en .env}
+      DB_PASSWORD: ${DB_PASSWORD:?Falta DB_PASSWORD en .env}
+      JPA_DDL_AUTO: ${JPA_DDL_AUTO:-update}
+    expose: ["8082"]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8082 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+
+  ms-gymflow-reservations:
+    <<: *java
+    build: ../../ms-gymflow-reservations
+    image: gymflow/ms-gymflow-reservations:latest
+    container_name: ms-gymflow-reservations
+    environment:
+      <<: *java-env
+      DB_URL: ${DB_URL:?Falta DB_URL en .env}
+      DB_USERNAME: ${DB_USERNAME:?Falta DB_USERNAME en .env}
+      DB_PASSWORD: ${DB_PASSWORD:?Falta DB_PASSWORD en .env}
+      JPA_DDL_AUTO: ${JPA_DDL_AUTO:-update}
+      CATALOG_URL: ${CATALOG_URL:-http://ms-gymflow-catalog:8082}
+    expose: ["8081"]
+    depends_on:
+      ms-gymflow-catalog:
+        condition: service_healthy
+    healthcheck:
+      <<: *health
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+
+  ms-gymflow-bff:
+    <<: *java
+    build: ../../ms-gymflow-bff
+    image: gymflow/ms-gymflow-bff:latest
+    container_name: ms-gymflow-bff
+    environment:
+      <<: *java-env
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:?Falta AZURE_TENANT_ID en .env}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:?Falta AZURE_CLIENT_ID en .env}
+      GYMFLOW_CORS_ORIGINS: ${GYMFLOW_CORS_ORIGINS:-http://localhost:4200}
+      RESERVATIONS_URL: ${RESERVATIONS_URL:-http://ms-gymflow-reservations:8081}
+      CATALOG_URL: ${CATALOG_URL:-http://ms-gymflow-catalog:8082}
+    # El único puerto publicado en la EC2. Lo consume el API Gateway (security group gymflow-apps-sg: 8080).
+    ports: ["8080:8080"]
+    depends_on:
+      ms-gymflow-catalog:
+        condition: service_healthy
+      ms-gymflow-reservations:
+        condition: service_healthy
+    healthcheck:
+      <<: *health
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+
+networks:
+  gymflow:
+    name: gymflow
