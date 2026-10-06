@@ -41,7 +41,7 @@ EC2 ec2-apps (t3.medium, Amazon Linux 2023) ── red Docker "gymflow" ──�
 | RDS | `gymflow-db`, PostgreSQL 17, db.t3.micro, us-east-1a, base `gymflow`, usuario `postgres`, puerto 5432 |
 | Acceso a RDS | Solo desde la EC2, mediante el security group `rds-ec2-1` |
 | EC2 RabbitMQ (EP2) | `ec2-mq`, t3.medium (4 GB), Amazon Linux 2023, IP elástica; 2 nodos de 1 GB cada uno |
-| Security group RabbitMQ | `gymflow-mq-sg`: 5672-5673 y 15672 desde `gymflow-apps-sg`; 15672 y 22 desde tu IP |
+| Security group RabbitMQ | `gymflow-mq-sg`: 5672-5673 y 15672 desde `gymflow-apps-sg`; 15672 desde tu IP; 22 desde `0.0.0.0/0` (EC2 Instance Connect) |
 
 ### Decisiones del `compose.yml`
 
