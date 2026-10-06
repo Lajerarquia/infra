@@ -1,9 +1,9 @@
 # GymFlow en la EC2 ec2-apps. Construye los 5 servicios desde los repos clonados al lado de infra/:
 #   ~/gymflow/infra/apps/compose.yml  →  ../../ms-gymflow-{bff,catalog,reservations,notify,mq-admin}
 #
-# - Solo el BFF publica un puerto a internet (8080). catalog, reservations y notify quedan en la red interna
+# - Solo el BFF publica un puerto (8080). catalog, reservations, notify y mq-admin quedan en la red interna
 #   "gymflow": desde internet no se llega a ellos; el BFF los llama por el nombre del servicio.
-# - mq-admin publica 8084 SOLO en 127.0.0.1 de la EC2: se usa con un túnel SSH, nunca desde internet.
+# - mq-admin se usa a través del BFF (/api/admin/mq/**, solo rol Admin), sin publicar su puerto.
 # - RabbitMQ corre en otra EC2 (ec2-mq, infra/mq/compose.yml). reservations publica ahí y notify consume.
 # - Las variables salen de apps/.env (ignorado por git). Las obligatorias usan ${VAR:?mensaje}:
 #   si faltan, "docker compose up" se detiene con ese mensaje en vez de arrancar mal configurado.
@@ -82,6 +82,9 @@ services:
       GYMFLOW_CORS_ORIGINS: ${GYMFLOW_CORS_ORIGINS:-http://localhost:4200}
       RESERVATIONS_URL: ${RESERVATIONS_URL:-http://ms-gymflow-reservations:8081}
       CATALOG_URL: ${CATALOG_URL:-http://ms-gymflow-catalog:8082}
+      # /api/admin/mq/** (solo Admin) se reenvía a mq-admin por la red interna. No depende de él para arrancar:
+      # si mq-admin no está, esas rutas responden 503 y el resto de la API sigue funcionando.
+      MQ_ADMIN_URL: ${MQ_ADMIN_URL:-http://ms-gymflow-mq-admin:8084}
     # El único puerto publicado en la EC2. Lo consume el API Gateway (security group gymflow-apps-sg: 8080).
     ports: ["8080:8080"]
     depends_on:
@@ -112,7 +115,8 @@ services:
       <<: *health
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8083 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
 
-  # Administración de RabbitMQ (colas, mensajes de prueba, reproceso de DLQ). Solo en 127.0.0.1: túnel SSH.
+  # Administración de RabbitMQ (colas, mensajes de prueba, reproceso de DLQ). Sin puertos publicados:
+  # se usa a través del BFF (/api/admin/mq/**, solo Admin).
   ms-gymflow-mq-admin:
     <<: *java
     mem_limit: 384m
@@ -125,7 +129,7 @@ services:
       RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:-gymflow}
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Falta RABBITMQ_PASSWORD en .env}
       RABBITMQ_MANAGEMENT_URL: ${RABBITMQ_MANAGEMENT_URL:?Falta RABBITMQ_MANAGEMENT_URL en .env}
-    ports: ["127.0.0.1:8084:8084"]
+    expose: ["8084"]
     healthcheck:
       <<: *health
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8084 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]

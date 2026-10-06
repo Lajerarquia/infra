@@ -4,7 +4,7 @@
 
 | EC2 | Qué corre | Compose |
 |---|---|---|
-| `ec2-apps` (ya existe, IP elástica `44.217.171.96`) | bff, catalog, reservations, **notify**, **mq-admin** | `infra/apps/compose.yml` |
+| `ec2-apps` (ya existe, IP elástica `44.217.171.96`) | bff, catalog, reservations, **notify**, **mq-admin** (sin puertos publicados; mq-admin vía BFF) | `infra/apps/compose.yml` |
 | `ec2-mq` (nueva) | RabbitMQ 3.13 con Management UI, clúster de 2 nodos (`rabbit1`, `rabbit2`) | `infra/mq/compose.yml` |
 
 ```
@@ -149,6 +149,7 @@ ssh -i labsuser.pem ec2-user@44.217.171.96
 cd ~/gymflow
 git -C infra pull
 git -C ms-gymflow-reservations pull
+git -C ms-gymflow-bff pull                    # rutas /api/admin/mq/**
 git clone https://github.com/Lajerarquia/ms-gymflow-notify.git
 git clone https://github.com/Lajerarquia/ms-gymflow-mq-admin.git
 ls ~/gymflow   # infra  ms-gymflow-bff  ms-gymflow-catalog  ms-gymflow-mq-admin  ms-gymflow-notify  ms-gymflow-reservations
@@ -164,6 +165,7 @@ nano .env      # agregar al final (el resto del .env no cambia):
 #   RABBITMQ_PASSWORD=<la misma de infra/mq/.env en ec2-mq>
 #   RABBITMQ_MANAGEMENT_URL=http://<ip-privada-ec2-mq>:15672
 #   SIMULAR_FALLA=NINGUNA
+#   MQ_ADMIN_URL=http://ms-gymflow-mq-admin:8084
 ```
 
 Usar la **IP privada** de `ec2-mq`, no la elástica: el security group solo acepta a `gymflow-apps-sg` por la red privada.
@@ -181,6 +183,7 @@ curl -s -u gymflow:<contraseña> http://<ip-privada-ec2-mq>:15672/api/overview |
 ```bash
 cd ~/gymflow/infra/apps
 docker compose build ms-gymflow-reservations
+docker compose build ms-gymflow-bff
 docker compose build ms-gymflow-notify
 docker compose build ms-gymflow-mq-admin
 docker compose up -d
@@ -206,17 +209,25 @@ docker logs ms-gymflow-notify | grep -E "\[EMAIL\]|\[TICKET\]|ACK"
 
 El `[EMAIL]` muestra como destinatario el email del socio. Los dos `ACK` comparten `traceId` y `correlationId`.
 
-**mq-admin** (solo escucha en `127.0.0.1` de `ec2-apps`; se usa con un túnel SSH desde tu PC):
+**mq-admin a través del BFF** (sin abrir puertos: API Gateway → JWT Authorizer → BFF → mq-admin por la red interna).
+Solo el rol **Admin** pasa; Instructor, Socio y Auditor reciben 403.
 
-```bash
-ssh -i labsuser.pem -L 8084:localhost:8084 ec2-user@44.217.171.96
-# en otra terminal de tu PC:
-curl -s localhost:8084/api/mq/queues
-curl -s -X POST localhost:8084/api/mq/test-messages -H "Content-Type: application/json" \
-  -d '{"exchange":"cmd.direct","routingKey":"invoice.gen","type":"INVOICE_GENERAR","payload":{"plan":"PLUS"}}'
+1. Inicia sesión en la URL pública con tu usuario Admin.
+2. F12 → **Network** → cualquier petición a `/api/...` → **Request Headers** → copia el valor de `Authorization`
+   (empieza con `Bearer eyJ...`; dura ~1 hora).
+3. En PowerShell:
+
+```powershell
+$G = "https://0z97ecbdsc.execute-api.us-east-1.amazonaws.com"
+$H = @{ Authorization = "Bearer eyJ..." }          # el valor copiado
+Invoke-RestMethod "$G/api/admin/mq/queues" -Headers $H | Format-Table
+Invoke-RestMethod "$G/api/admin/mq/test-messages" -Method Post -Headers $H -ContentType "application/json" `
+  -Body '{"exchange":"cmd.direct","routingKey":"invoice.gen","type":"INVOICE_GENERAR","payload":{"plan":"PLUS"}}'
+Invoke-RestMethod "$G/api/admin/mq/queues/q.cmd.email.dlq/reprocess" -Method Post -Headers $H
 ```
 
-En `ec2-apps`: `docker logs ms-gymflow-notify | grep INVOICE`.
+En `ec2-apps`: `docker logs ms-gymflow-notify | grep INVOICE`. Con el token de `instructor@` la misma llamada
+responde **403**, y sin token **401** (lo responde el JWT Authorizer del Gateway).
 
 **Reintentos y DLQ** (en `ec2-apps`):
 
@@ -225,9 +236,14 @@ cd ~/gymflow/infra/apps
 SIMULAR_FALLA=TRANSITORIA docker compose up -d ms-gymflow-notify
 # confirmar otra reserva en la web
 docker logs ms-gymflow-notify | grep -E "Reintento|NACK"   # Reintento 1, Reintento 2, NACK → DLQ
-curl -s localhost:8084/api/mq/queues                        # (túnel) q.cmd.email.dlq y q.cmd.checkin.dlq con 1
 SIMULAR_FALLA=NINGUNA docker compose up -d ms-gymflow-notify
-curl -s -X POST localhost:8084/api/mq/queues/q.cmd.email.dlq/reprocess   # (túnel) vuelve a q.cmd.email y se procesa
+```
+
+Desde tu PC (PowerShell, con `$G` y `$H` del punto anterior):
+
+```powershell
+Invoke-RestMethod "$G/api/admin/mq/queues" -Headers $H | Format-Table     # q.cmd.email.dlq y q.cmd.checkin.dlq con 1
+Invoke-RestMethod "$G/api/admin/mq/queues/q.cmd.email.dlq/reprocess" -Method Post -Headers $H   # vuelve y se procesa
 ```
 
 **Idempotencia**: publicar dos veces el mismo `eventId` con mq-admin (campo `"eventId"`); notify lo procesa una vez y
@@ -237,7 +253,7 @@ registra "Duplicado ignorado".
 
 ```powershell
 Test-NetConnection <ip-elastica-ec2-mq> -Port 5672    # TcpTestSucceeded: False (AMQP solo desde ec2-apps)
-Test-NetConnection 44.217.171.96 -Port 8084           # False (mq-admin solo en 127.0.0.1)
+Test-NetConnection 44.217.171.96 -Port 8084           # False (mq-admin sin puertos publicados)
 Test-NetConnection 44.217.171.96 -Port 8083           # False (notify no publica puertos)
 ```
 

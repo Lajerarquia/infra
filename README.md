@@ -27,7 +27,7 @@ EC2 ec2-apps (t3.medium, Amazon Linux 2023) ── red Docker "gymflow" ──�
 │  ms-gymflow-bff :8080  (único puerto publicado)                                            │
 │     ├─> ms-gymflow-reservations :8081 ──> ms-gymflow-catalog (tomar/devolver cupo)          │
 │     └─> ms-gymflow-catalog :8082                                                            │
-│  ms-gymflow-notify :8083 (consumidor)     ms-gymflow-mq-admin :8084 (solo 127.0.0.1)        │
+│  ms-gymflow-notify :8083 (consumidor)     ms-gymflow-mq-admin :8084 (vía BFF /api/admin/mq) │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
           catalog y reservations ──> Amazon RDS PostgreSQL 17 (gymflow-db, sin acceso público)
           reservations ──publica──> EC2 ec2-mq: RabbitMQ rabbit1 :5672 + rabbit2 :5673 (UI :15672)
@@ -47,8 +47,8 @@ EC2 ec2-apps (t3.medium, Amazon Linux 2023) ── red Docker "gymflow" ──�
 
 - **Solo el BFF publica un puerto (8080).** catalog y reservations solo tienen `expose`: se ven dentro de la red
   `gymflow` por su nombre (`http://ms-gymflow-catalog:8082`), pero no desde internet. Así se cumple el flujo
-  JWT → API Gateway → BFF → microservicio. notify tampoco publica nada; mq-admin publica 8084 solo en `127.0.0.1`
-  (se usa con un túnel SSH).
+  JWT → API Gateway → BFF → microservicio. notify y mq-admin tampoco publican puertos; mq-admin se usa a través
+  del BFF (`/api/admin/mq/**`, solo rol Admin).
 - **Healthchecks sobre `/actuator/health`.** En catalog y reservations ese health incluye la conexión a RDS:
   "healthy" significa que la app arrancó **y** llega a la base. Se hace con `bash` y `/dev/tcp` porque la imagen
   `eclipse-temurin:17-jre` no garantiza tener `curl`. En reservations **no** se incluye RabbitMQ (si el broker cae,
