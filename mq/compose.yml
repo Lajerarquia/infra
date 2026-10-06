@@ -1,0 +1,58 @@
+# RabbitMQ de GymFlow en la EC2 ec2-mq: clúster de 2 nodos con Management UI.
+#   ~/gymflow/infra/mq/compose.yml  (variables en mq/.env, ignorado por git)
+#
+# - Los dos nodos corren en la misma EC2 (t3.medium del Learner Lab). Muestra el clúster funcionando, pero no
+#   protege contra la caída de la EC2.
+# - Se unen solos al arrancar gracias a rabbitmq.conf (classic_config) y al mismo Erlang cookie.
+# - Puertos publicados: 5672 (AMQP rabbit1), 5673 (AMQP rabbit2) y 15672 (Management UI de rabbit1).
+#   El security group gymflow-mq-sg deja 5672/5673 solo para ec2-apps y 15672 solo para la IP del equipo.
+#   Los puertos internos del clúster (4369 y 25672) quedan dentro de la red de Docker.
+# - Memoria: 1 GB por nodo (2 GB de 4 GB). rabbitmq.conf fija ese mismo valor como memoria disponible.
+
+name: gymflow-mq
+
+x-rabbit: &rabbit
+  image: rabbitmq:3.13-management
+  restart: unless-stopped
+  mem_limit: 1g
+  networks: [mq]
+  environment: &rabbit-env
+    RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?Falta RABBITMQ_DEFAULT_USER en .env}
+    RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?Falta RABBITMQ_DEFAULT_PASS en .env}
+    RABBITMQ_ERLANG_COOKIE: ${RABBITMQ_ERLANG_COOKIE:?Falta RABBITMQ_ERLANG_COOKIE en .env}
+  healthcheck:
+    test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+    interval: 10s
+    timeout: 5s
+    retries: 10
+    start_period: 30s
+
+services:
+  rabbit1:
+    <<: *rabbit
+    hostname: rabbit1
+    container_name: rabbit1
+    ports:
+      - "5672:5672"     # AMQP (lo usan reservations y notify)
+      - "15672:15672"   # Management UI y API HTTP
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - rabbit1_data:/var/lib/rabbitmq
+
+  rabbit2:
+    <<: *rabbit
+    hostname: rabbit2
+    container_name: rabbit2
+    ports:
+      - "5673:5672"     # AMQP del segundo nodo (las apps lo usan si rabbit1 no responde)
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - rabbit2_data:/var/lib/rabbitmq
+
+volumes:
+  rabbit1_data:
+  rabbit2_data:
+
+networks:
+  mq:
+    name: gymflow-mq
