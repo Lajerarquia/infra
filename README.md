@@ -1,14 +1,20 @@
 # infra — despliegue de GymFlow en AWS
 
-Infraestructura del proyecto GymFlow (DSY1107, EP1): Docker Compose para la EC2 y la guía del API Gateway.
+Infraestructura del proyecto GymFlow (DSY1107): Docker Compose para las EC2 y la guía del API Gateway.
+EP2: RabbitMQ en una EC2 propia (`ec2-mq`) y dos servicios nuevos en `ec2-apps` (notify y mq-admin).
 
 ```
 infra/
-├── apps/
-│   ├── compose.yml      # BFF + catalog + reservations, construidos desde los repos clonados al lado
+├── apps/                # EC2 ec2-apps
+│   ├── compose.yml      # bff + catalog + reservations + notify + mq-admin, construidos desde los repos clonados al lado
 │   └── .env.example     # variables (sin contraseñas); se copia como .env en la EC2
+├── mq/                  # EC2 ec2-mq (EP2)
+│   ├── compose.yml      # RabbitMQ 3.13 con Management UI, clúster de 2 nodos
+│   ├── rabbitmq.conf    # formación del clúster y límites de memoria/disco
+│   └── .env.example     # usuario, contraseña y Erlang cookie
 └── docs/
-    └── api-gateway.md   # HTTP API con JWT Authorizer de Azure AD → BFF en la EC2
+    ├── api-gateway.md   # HTTP API con JWT Authorizer de Azure AD → BFF en la EC2
+    └── rabbitmq.md      # ec2-mq, security groups, despliegue y pruebas de RabbitMQ
 ```
 
 ## Arquitectura
@@ -21,8 +27,11 @@ EC2 ec2-apps (t3.medium, Amazon Linux 2023) ── red Docker "gymflow" ──�
 │  ms-gymflow-bff :8080  (único puerto publicado)                                            │
 │     ├─> ms-gymflow-reservations :8081 ──> ms-gymflow-catalog (tomar/devolver cupo)          │
 │     └─> ms-gymflow-catalog :8082                                                            │
+│  ms-gymflow-notify :8083 (consumidor)     ms-gymflow-mq-admin :8084 (solo 127.0.0.1)        │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
           catalog y reservations ──> Amazon RDS PostgreSQL 17 (gymflow-db, sin acceso público)
+          reservations ──publica──> EC2 ec2-mq: RabbitMQ rabbit1 :5672 + rabbit2 :5673 (UI :15672)
+                                         └──> notify consume (ACK/NACK, reintentos, DLQ)
 ```
 
 | Recurso | Valor |
@@ -31,21 +40,27 @@ EC2 ec2-apps (t3.medium, Amazon Linux 2023) ── red Docker "gymflow" ──�
 | Security group EC2 | `gymflow-apps-sg`: entrada 22 (SSH) y 8080 (BFF) |
 | RDS | `gymflow-db`, PostgreSQL 17, db.t3.micro, us-east-1a, base `gymflow`, usuario `postgres`, puerto 5432 |
 | Acceso a RDS | Solo desde la EC2, mediante el security group `rds-ec2-1` |
+| EC2 RabbitMQ (EP2) | `ec2-mq`, t3.medium (4 GB), Amazon Linux 2023; 2 nodos de 1 GB cada uno |
+| Security group RabbitMQ | `gymflow-mq-sg`: 5672-5673 y 15672 desde `gymflow-apps-sg`; 15672 y 22 desde tu IP |
 
 ### Decisiones del `compose.yml`
 
 - **Solo el BFF publica un puerto (8080).** catalog y reservations solo tienen `expose`: se ven dentro de la red
   `gymflow` por su nombre (`http://ms-gymflow-catalog:8082`), pero no desde internet. Así se cumple el flujo
-  JWT → API Gateway → BFF → microservicio.
+  JWT → API Gateway → BFF → microservicio. notify tampoco publica nada; mq-admin publica 8084 solo en `127.0.0.1`
+  (se usa con un túnel SSH).
 - **Healthchecks sobre `/actuator/health`.** En catalog y reservations ese health incluye la conexión a RDS:
   "healthy" significa que la app arrancó **y** llega a la base. Se hace con `bash` y `/dev/tcp` porque la imagen
-  `eclipse-temurin:17-jre` no garantiza tener `curl`.
+  `eclipse-temurin:17-jre` no garantiza tener `curl`. En reservations **no** se incluye RabbitMQ (si el broker cae,
+  las reservas siguen y el BFF puede arrancar); en notify y mq-admin sí.
 - **`depends_on` con `service_healthy`.** Primero catalog; luego reservations (lo necesita para los cupos);
   al final el BFF, que solo arranca cuando los dos están sanos.
-- **512 MB por contenedor** (`mem_limit`). Java 17 detecta el límite del contenedor; con
-  `-XX:MaxRAMPercentage=70` el heap llega a unos 360 MB y queda margen para metaspace e hilos.
+- **512 MB por contenedor** (`mem_limit`) para bff, catalog y reservations, y **384 MB** para notify y mq-admin
+  (sin BD y con poca carga). Java 17 detecta el límite del contenedor; con `-XX:MaxRAMPercentage=70` el heap llega
+  a unos 360 MB (270 MB en los de 384) y queda margen para metaspace e hilos.
   `-XX:+ExitOnOutOfMemoryError` hace que, si se agota la memoria, el proceso termine y Docker lo reinicie
-  (`restart: unless-stopped`) en vez de quedar colgado. Total: 1,5 GB de 4 GB.
+  (`restart: unless-stopped`) en vez de quedar colgado. Total: ~2,3 GB de 4 GB. **Cuidar la memoria**: es una
+  t3.medium del Learner Lab y compilar con Maven también consume; por eso las imágenes se construyen de a una.
 - **Variables obligatorias con `${VAR:?mensaje}`.** Si falta algo en el `.env`, `docker compose` se detiene
   con ese mensaje en vez de arrancar mal configurado.
 - **Dockerfiles** (en cada repo de servicio): compilan en dos etapas con el wrapper de Maven sobre
@@ -80,14 +95,14 @@ sudo usermod -aG docker ec2-user
 exit                           # salir y volver a entrar por ssh para que tome el grupo
 ```
 
-### 3. Clonar los 4 repos en `~/gymflow`
+### 3. Clonar los 6 repos en `~/gymflow`
 
 ```bash
 mkdir -p ~/gymflow && cd ~/gymflow
-for repo in infra ms-gymflow-bff ms-gymflow-catalog ms-gymflow-reservations; do
+for repo in infra ms-gymflow-bff ms-gymflow-catalog ms-gymflow-reservations ms-gymflow-notify ms-gymflow-mq-admin; do
   git clone https://github.com/Lajerarquia/$repo.git
 done
-ls ~/gymflow                   # infra  ms-gymflow-bff  ms-gymflow-catalog  ms-gymflow-reservations
+ls ~/gymflow   # infra  ms-gymflow-bff  ms-gymflow-catalog  ms-gymflow-mq-admin  ms-gymflow-notify  ms-gymflow-reservations
 ```
 
 Si los repos son privados, git pide usuario y un *personal access token* de GitHub (no la contraseña).
@@ -106,6 +121,8 @@ Completa:
 - `DB_URL`: reemplaza `<endpoint-rds>` por el endpoint de `gymflow-db` (consola de RDS → Connectivity & security).
   Ejemplo: `jdbc:postgresql://gymflow-db.xxxxxxxx.us-east-1.rds.amazonaws.com:5432/gymflow?sslmode=require`
 - `DB_PASSWORD`: la contraseña real de `postgres`. **Solo aquí**, nunca en un repo.
+- `RABBITMQ_ADDRESSES`, `RABBITMQ_MANAGEMENT_URL` y `RABBITMQ_PASSWORD` (EP2): IP privada de `ec2-mq` y la contraseña de
+  `infra/mq/.env`. Ver [docs/rabbitmq.md](docs/rabbitmq.md).
 - Lo demás (Azure, URLs internas, CORS) ya viene con los valores correctos.
 
 ### 5. Construir y levantar
@@ -114,7 +131,7 @@ Completa:
 cd ~/gymflow/infra/apps
 docker compose build           # la primera vez tarda varios minutos (descarga dependencias de Maven)
 docker compose up -d
-docker compose ps              # esperar a que los 3 digan "healthy" (hasta ~2 minutos)
+docker compose ps              # esperar a que los 5 digan "healthy" (hasta ~2 minutos)
 ```
 
 Si la compilación se queda sin memoria (las tres en paralelo), constrúyelas de a una:
@@ -123,6 +140,8 @@ Si la compilación se queda sin memoria (las tres en paralelo), constrúyelas de
 docker compose build ms-gymflow-catalog
 docker compose build ms-gymflow-reservations
 docker compose build ms-gymflow-bff
+docker compose build ms-gymflow-notify
+docker compose build ms-gymflow-mq-admin
 docker compose up -d
 ```
 
@@ -163,7 +182,7 @@ docker run --rm -it postgres:17 psql "host=<endpoint-rds> dbname=gymflow user=po
 
 ```bash
 cd ~/gymflow
-for repo in infra ms-gymflow-bff ms-gymflow-catalog ms-gymflow-reservations; do git -C $repo pull; done
+for repo in infra ms-gymflow-bff ms-gymflow-catalog ms-gymflow-reservations ms-gymflow-notify ms-gymflow-mq-admin; do git -C $repo pull; done
 cd infra/apps && docker compose up -d --build
 ```
 
@@ -176,3 +195,7 @@ cd ~/gymflow/infra/apps && docker compose down
 ## API Gateway
 
 Ver [docs/api-gateway.md](docs/api-gateway.md).
+
+## RabbitMQ (EP2)
+
+Ver [docs/rabbitmq.md](docs/rabbitmq.md): crear `ec2-mq`, security groups, levantar el clúster y probar el flujo.

@@ -1,12 +1,14 @@
-# GymFlow en la EC2 ec2-apps. Construye los 3 servicios desde los repos clonados al lado de infra/:
-#   ~/gymflow/infra/apps/compose.yml  →  ../../ms-gymflow-bff, ../../ms-gymflow-catalog, ../../ms-gymflow-reservations
+# GymFlow en la EC2 ec2-apps. Construye los 5 servicios desde los repos clonados al lado de infra/:
+#   ~/gymflow/infra/apps/compose.yml  →  ../../ms-gymflow-{bff,catalog,reservations,notify,mq-admin}
 #
-# - Solo el BFF publica un puerto (8080). catalog y reservations quedan en la red interna "gymflow":
-#   desde internet no se llega a ellos; el BFF los llama por el nombre del servicio.
+# - Solo el BFF publica un puerto a internet (8080). catalog, reservations y notify quedan en la red interna
+#   "gymflow": desde internet no se llega a ellos; el BFF los llama por el nombre del servicio.
+# - mq-admin publica 8084 SOLO en 127.0.0.1 de la EC2: se usa con un túnel SSH, nunca desde internet.
+# - RabbitMQ corre en otra EC2 (ec2-mq, infra/mq/compose.yml). reservations publica ahí y notify consume.
 # - Las variables salen de apps/.env (ignorado por git). Las obligatorias usan ${VAR:?mensaje}:
 #   si faltan, "docker compose up" se detiene con ese mensaje en vez de arrancar mal configurado.
-# - Cada contenedor tiene un límite de 512 MB. La JVM respeta el límite del contenedor y se le da el 70 %
-#   para el heap (~360 MB); el resto queda para metaspace, hilos y buffers.
+# - Memoria (t3.medium, 4 GB): 512 MB para bff, catalog y reservations; 384 MB para notify y mq-admin, que no tienen
+#   BD ni mucha carga. Total ~2,3 GB. La JVM respeta el límite del contenedor y usa el 70 % para el heap.
 
 name: gymflow
 
@@ -56,6 +58,10 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:?Falta DB_PASSWORD en .env}
       JPA_DDL_AUTO: ${JPA_DDL_AUTO:-update}
       CATALOG_URL: ${CATALOG_URL:-http://ms-gymflow-catalog:8082}
+      # Publica email y ticket al CONFIRMAR. Si RabbitMQ no responde, la reserva igual se confirma.
+      RABBITMQ_ADDRESSES: ${RABBITMQ_ADDRESSES:?Falta RABBITMQ_ADDRESSES en .env}
+      RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:-gymflow}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Falta RABBITMQ_PASSWORD en .env}
     expose: ["8081"]
     depends_on:
       ms-gymflow-catalog:
@@ -86,6 +92,43 @@ services:
     healthcheck:
       <<: *health
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+
+  # Consumidor RabbitMQ (EP2). Declara la topología al conectarse. Su health incluye la conexión a RabbitMQ.
+  ms-gymflow-notify:
+    <<: *java
+    mem_limit: 384m
+    build: ../../ms-gymflow-notify
+    image: gymflow/ms-gymflow-notify:latest
+    container_name: ms-gymflow-notify
+    environment:
+      <<: *java-env
+      RABBITMQ_ADDRESSES: ${RABBITMQ_ADDRESSES:?Falta RABBITMQ_ADDRESSES en .env}
+      RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:-gymflow}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Falta RABBITMQ_PASSWORD en .env}
+      # Solo para la demo de reintentos y DLQ: NINGUNA, TRANSITORIA o PERMANENTE
+      SIMULAR_FALLA: ${SIMULAR_FALLA:-NINGUNA}
+    expose: ["8083"]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8083 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+
+  # Administración de RabbitMQ (colas, mensajes de prueba, reproceso de DLQ). Solo en 127.0.0.1: túnel SSH.
+  ms-gymflow-mq-admin:
+    <<: *java
+    mem_limit: 384m
+    build: ../../ms-gymflow-mq-admin
+    image: gymflow/ms-gymflow-mq-admin:latest
+    container_name: ms-gymflow-mq-admin
+    environment:
+      <<: *java-env
+      RABBITMQ_ADDRESSES: ${RABBITMQ_ADDRESSES:?Falta RABBITMQ_ADDRESSES en .env}
+      RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:-gymflow}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Falta RABBITMQ_PASSWORD en .env}
+      RABBITMQ_MANAGEMENT_URL: ${RABBITMQ_MANAGEMENT_URL:?Falta RABBITMQ_MANAGEMENT_URL en .env}
+    ports: ["127.0.0.1:8084:8084"]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8084 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
 
 networks:
   gymflow:
