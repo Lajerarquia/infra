@@ -1,0 +1,2 @@
+# Los scripts de shell siempre con LF: con CRLF fallan en Linux ("$'\r': command not found").
+*.sh text eol=lf

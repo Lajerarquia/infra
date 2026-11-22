@@ -2,6 +2,7 @@
 
 Infraestructura del proyecto GymFlow (DSY1107): Docker Compose para las EC2 y la guía del API Gateway.
 EP2: RabbitMQ en una EC2 propia (`ec2-mq`) y dos servicios nuevos en `ec2-apps` (notify y mq-admin).
+EP5: Kafka (3 ZooKeeper + 3 brokers + Kafka UI) en una EC2 propia (`ec2-kafka`) para eventos de analítica y auditoría.
 
 ```
 infra/
@@ -12,9 +13,15 @@ infra/
 │   ├── compose.yml      # RabbitMQ 3.13 con Management UI, clúster de 2 nodos
 │   ├── rabbitmq.conf    # formación del clúster y límites de memoria/disco
 │   └── .env.example     # usuario, contraseña y Erlang cookie
+├── kafka/               # EC2 ec2-kafka (EP5)
+│   ├── compose.yml      # 3 ZooKeeper + 3 brokers Confluent 7.9 + Kafka UI
+│   ├── .env.example     # IP anunciada por los brokers y login de Kafka UI
+│   └── scripts/
+│       └── crear-topicos.sh  # crea/actualiza los 4 tópicos (idempotente) y describe tópicos y consumer groups
 └── docs/
     ├── api-gateway.md   # HTTP API con JWT Authorizer de Azure AD → BFF en la EC2
-    └── rabbitmq.md      # ec2-mq, security groups, despliegue y pruebas de RabbitMQ
+    ├── rabbitmq.md      # ec2-mq, security groups, despliegue y pruebas de RabbitMQ
+    └── kafka.md         # ec2-kafka, security group, tópicos, Kafka UI y pruebas de tolerancia a fallas
 ```
 
 ## Arquitectura
@@ -42,6 +49,8 @@ EC2 ec2-apps (t3.medium, Amazon Linux 2023) ── red Docker "gymflow" ──�
 | Acceso a RDS | Solo desde la EC2, mediante el security group `rds-ec2-1` |
 | EC2 RabbitMQ (EP2) | `ec2-mq`, t3.medium (4 GB), Amazon Linux 2023, IP elástica; 2 nodos de 1 GB cada uno |
 | Security group RabbitMQ | `gymflow-mq-sg`: 5672-5673 y 15672 desde `gymflow-apps-sg`; 15672 desde tu IP; 22 desde `0.0.0.0/0` (EC2 Instance Connect) |
+| EC2 Kafka (EP5) | `ec2-kafka`, t3.medium (4 GB), Amazon Linux 2023, IP elástica, 16 GiB; 3 ZooKeeper + 3 brokers + Kafka UI |
+| Security group Kafka | `gymflow-kafka-sg`: 9092-9094 desde `gymflow-apps-sg`; 8080 (Kafka UI) desde tu IP; 22 desde `0.0.0.0/0` |
 
 ### Decisiones del `compose.yml`
 
@@ -199,3 +208,8 @@ Ver [docs/api-gateway.md](docs/api-gateway.md).
 ## RabbitMQ (EP2)
 
 Ver [docs/rabbitmq.md](docs/rabbitmq.md): crear `ec2-mq`, security groups, levantar el clúster y probar el flujo.
+
+## Kafka (EP5)
+
+Ver [docs/kafka.md](docs/kafka.md): crear `ec2-kafka`, security group, levantar el clúster, crear los tópicos con
+`kafka/scripts/crear-topicos.sh` y probar con Kafka UI. Orden de encendido: RDS → `ec2-mq` → **`ec2-kafka`** → `ec2-apps`.

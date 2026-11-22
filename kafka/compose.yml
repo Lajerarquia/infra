@@ -1,0 +1,200 @@
+# Kafka de GymFlow (EP5) en la EC2 ec2-kafka: 3 ZooKeeper + 3 brokers + Kafka UI.
+#   ~/gymflow/infra/kafka/compose.yml  (variables en kafka/.env, ignorado por git)
+#
+# - Confluent Platform 7.9 (Apache Kafka 3.9): la ÚLTIMA línea que soporta ZooKeeper. Kafka 4.x / cp 8.x solo
+#   funcionan en modo KRaft, y la pauta pide explícitamente "Zookeeper + brokers".
+# - Ensemble de 3 ZooKeeper: con 3 nodos el quórum es 2, así que tolera la caída de 1 (con 2 nodos no toleraría ninguna).
+# - 3 brokers: permiten replication.factor=3 con min.insync.replicas=2 → con acks=all se tolera la caída de 1 broker
+#   sin perder escrituras confirmadas.
+# - Dos listeners por broker:
+#     INTERNAL  kafkaN:29092                      → red de Docker (tráfico entre brokers y Kafka UI)
+#     EXTERNAL  ${KAFKA_ADVERTISED_HOST}:9092/3/4 → clientes fuera de Docker (los microservicios de ec2-apps)
+#   Cada broker publica un puerto distinto (9092, 9093, 9094) porque comparten la misma IP de la EC2: el cliente se
+#   conecta a la dirección EXACTA que el broker anuncia, por eso el puerto interno y el publicado son iguales.
+# - auto.create.topics.enable=false: los tópicos solo se crean con scripts/crear-topicos.sh, kafka-admin o NewTopic.
+# - Puertos publicados: 9092-9094 (security group: solo desde gymflow-apps-sg) y 8080 (Kafka UI, solo IP del equipo).
+#   ZooKeeper (2181/2888/3888) NO se publica: solo lo usan los brokers dentro de la red de Docker.
+# - Memoria (t3.medium, 4 GB). Límites: ZK 320 MB ×3 + brokers 768 MB ×3 + UI 384 MB = 3,6 GB como TECHO.
+#   El consumo real es menor (~2,5 GB): el heap tiene un -Xms bajo y crece solo si hace falta. Al broker se le deja
+#   ~250 MB fuera del heap para metaspace, hilos, buffers de red y caché de páginas de los logs.
+
+name: gymflow-kafka
+
+x-zookeeper: &zookeeper
+  image: confluentinc/cp-zookeeper:7.9.10
+  restart: unless-stopped
+  mem_limit: 320m
+  networks: [kafka]
+  healthcheck:
+    # "srvr" (comando de 4 letras, habilitado por defecto) responde "Mode: leader|follower" solo cuando el nodo está
+    # en el quórum. bash + /dev/tcp porque la imagen no garantiza nc.
+    test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/2181 && echo srvr >&3 && grep -qE \"Mode: (leader|follower)\" <&3'"]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 20s
+
+x-zookeeper-env: &zookeeper-env
+  ZOOKEEPER_CLIENT_PORT: 2181
+  ZOOKEEPER_TICK_TIME: 2000
+  ZOOKEEPER_INIT_LIMIT: 10        # ticks que un follower tiene para conectarse y sincronizar con el líder
+  ZOOKEEPER_SYNC_LIMIT: 5         # ticks que un follower puede ir atrasado antes de salir del quórum
+  ZOOKEEPER_SERVERS: zookeeper1:2888:3888;zookeeper2:2888:3888;zookeeper3:2888:3888
+  KAFKA_HEAP_OPTS: -Xms64m -Xmx256m
+
+x-kafka: &kafka
+  image: confluentinc/cp-kafka:7.9.10
+  restart: unless-stopped
+  mem_limit: 768m
+  networks: [kafka]
+  depends_on:
+    zookeeper1: { condition: service_healthy }
+    zookeeper2: { condition: service_healthy }
+    zookeeper3: { condition: service_healthy }
+  healthcheck:
+    # Pregunta al propio broker por su listener interno: solo responde cuando ya se registró y atiende solicitudes.
+    # La herramienta es otra JVM: se lanza con heap mínimo para no chocar con el mem_limit del contenedor.
+    test: ["CMD-SHELL", "KAFKA_HEAP_OPTS='-Xms16m -Xmx64m' kafka-broker-api-versions --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+    interval: 30s
+    timeout: 20s
+    retries: 10
+    start_period: 40s
+
+x-kafka-env: &kafka-env
+  KAFKA_ZOOKEEPER_CONNECT: zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  # Tópicos: nadie crea uno "por accidente" (p. ej. con 1 partición por un typo en el nombre).
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_NUM_PARTITIONS: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  # Tópicos internos (offsets de los consumer groups y transacciones) con la misma tolerancia que los de negocio.
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  # Nunca elegir como líder una réplica atrasada (perdería mensajes confirmados). Es el valor por defecto; se deja explícito.
+  KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false"
+  KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+
+services:
+  zookeeper1:
+    <<: *zookeeper
+    hostname: zookeeper1
+    container_name: zookeeper1
+    environment:
+      <<: *zookeeper-env
+      ZOOKEEPER_SERVER_ID: 1
+    volumes:
+      - zookeeper1_data:/var/lib/zookeeper/data
+      - zookeeper1_log:/var/lib/zookeeper/log
+
+  zookeeper2:
+    <<: *zookeeper
+    hostname: zookeeper2
+    container_name: zookeeper2
+    environment:
+      <<: *zookeeper-env
+      ZOOKEEPER_SERVER_ID: 2
+    volumes:
+      - zookeeper2_data:/var/lib/zookeeper/data
+      - zookeeper2_log:/var/lib/zookeeper/log
+
+  zookeeper3:
+    <<: *zookeeper
+    hostname: zookeeper3
+    container_name: zookeeper3
+    environment:
+      <<: *zookeeper-env
+      ZOOKEEPER_SERVER_ID: 3
+    volumes:
+      - zookeeper3_data:/var/lib/zookeeper/data
+      - zookeeper3_log:/var/lib/zookeeper/log
+
+  kafka1:
+    <<: *kafka
+    hostname: kafka1
+    container_name: kafka1
+    ports:
+      - "9092:9092"
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 1
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka1:29092,EXTERNAL://${KAFKA_ADVERTISED_HOST:?Falta KAFKA_ADVERTISED_HOST en .env}:9092
+    volumes:
+      - kafka1_data:/var/lib/kafka/data
+
+  kafka2:
+    <<: *kafka
+    hostname: kafka2
+    container_name: kafka2
+    ports:
+      - "9093:9093"
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 2
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka2:29092,EXTERNAL://${KAFKA_ADVERTISED_HOST:?Falta KAFKA_ADVERTISED_HOST en .env}:9093
+    volumes:
+      - kafka2_data:/var/lib/kafka/data
+
+  kafka3:
+    <<: *kafka
+    hostname: kafka3
+    container_name: kafka3
+    ports:
+      - "9094:9094"
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 3
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka3:29092,EXTERNAL://${KAFKA_ADVERTISED_HOST:?Falta KAFKA_ADVERTISED_HOST en .env}:9094
+    volumes:
+      - kafka3_data:/var/lib/kafka/data
+
+  kafka-ui:
+    # kafbat/kafka-ui: fork mantenido de provectuslabs/kafka-ui (el original no se actualiza desde 2023).
+    image: kafbat/kafka-ui:v1.5.0
+    container_name: kafka-ui
+    restart: unless-stopped
+    mem_limit: 384m
+    networks: [kafka]
+    ports:
+      - "8080:8080"
+    depends_on:
+      kafka1: { condition: service_healthy }
+      kafka2: { condition: service_healthy }
+      kafka3: { condition: service_healthy }
+    environment:
+      KAFKA_CLUSTERS_0_NAME: gymflow
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka1:29092,kafka2:29092,kafka3:29092
+      # La configuración se define aquí (reproducible); no se edita desde la propia UI.
+      DYNAMIC_CONFIG_ENABLED: "false"
+      # Login con usuario y contraseña: el puerto 8080 queda abierto a la IP del equipo, pero igual se protege.
+      AUTH_TYPE: LOGIN_FORM
+      SPRING_SECURITY_USER_NAME: ${KAFKA_UI_USER:?Falta KAFKA_UI_USER en .env}
+      SPRING_SECURITY_USER_PASSWORD: ${KAFKA_UI_PASSWORD:?Falta KAFKA_UI_PASSWORD en .env}
+      JAVA_OPTS: -XX:MaxRAMPercentage=70
+    healthcheck:
+      # Imagen basada en Alpine: trae wget (busybox). /actuator/health no exige login.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+volumes:
+  zookeeper1_data:
+  zookeeper1_log:
+  zookeeper2_data:
+  zookeeper2_log:
+  zookeeper3_data:
+  zookeeper3_log:
+  kafka1_data:
+  kafka2_data:
+  kafka3_data:
+
+networks:
+  kafka:
+    name: gymflow-kafka
