@@ -35,10 +35,15 @@ EC2 ec2-apps (t3.medium, Amazon Linux 2023) ── red Docker "gymflow" ──�
 │     ├─> ms-gymflow-reservations :8081 ──> ms-gymflow-catalog (tomar/devolver cupo)          │
 │     └─> ms-gymflow-catalog :8082                                                            │
 │  ms-gymflow-notify :8083 (consumidor)     ms-gymflow-mq-admin :8084 (vía BFF /api/admin/mq) │
+│  EP5: ms-gymflow-report :8085 (vía BFF /api/report)   ms-gymflow-audit :8086 (/api/audit)    │
+│       ms-gymflow-kafka-admin :8087 (vía BFF /api/admin/kafka)                               │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
-          catalog y reservations ──> Amazon RDS PostgreSQL 17 (gymflow-db, sin acceso público)
+          catalog, reservations, report y audit ──> Amazon RDS PostgreSQL 17 (gymflow-db, sin acceso público)
           reservations ──publica──> EC2 ec2-mq: RabbitMQ rabbit1 :5672 + rabbit2 :5673 (UI :15672)
                                          └──> notify consume (ACK/NACK, reintentos, DLQ)
+          reservations, catalog ──publican──> EC2 ec2-kafka: kafka1..3 :9092-9094 (Kafka UI :8080)
+                                         ├──> report consume reservations.events (grupo gymflow-report)
+                                         └──> audit consume audit.timeline (grupo gymflow-audit)
 ```
 
 | Recurso | Valor |
@@ -64,12 +69,17 @@ EC2 ec2-apps (t3.medium, Amazon Linux 2023) ── red Docker "gymflow" ──�
   las reservas siguen y el BFF puede arrancar); en notify y mq-admin sí.
 - **`depends_on` con `service_healthy`.** Primero catalog; luego reservations (lo necesita para los cupos);
   al final el BFF, que solo arranca cuando los dos están sanos.
-- **512 MB por contenedor** (`mem_limit`) para bff, catalog y reservations, y **384 MB** para notify y mq-admin
-  (sin BD y con poca carga). Java 17 detecta el límite del contenedor; con `-XX:MaxRAMPercentage=70` el heap llega
-  a unos 360 MB (270 MB en los de 384) y queda margen para metaspace e hilos.
+- **512 MB por contenedor** (`mem_limit`) para bff, catalog y reservations, **384 MB** para notify, mq-admin, report
+  y audit, y **320 MB** para kafka-admin (sin BD, solo `AdminClient`). Java 17 detecta el límite del contenedor; con
+  `-XX:MaxRAMPercentage=70` el heap llega a unos 360 MB (270 MB en los de 384) y queda margen para metaspace e hilos.
   `-XX:+ExitOnOutOfMemoryError` hace que, si se agota la memoria, el proceso termine y Docker lo reinicie
-  (`restart: unless-stopped`) en vez de quedar colgado. Total: ~2,3 GB de 4 GB. **Cuidar la memoria**: es una
+  (`restart: unless-stopped`) en vez de quedar colgado. Total: ~3,4 GB de 4 GB. **Cuidar la memoria**: es una
   t3.medium del Learner Lab y compilar con Maven también consume; por eso las imágenes se construyen de a una.
+- **EP5: report y audit sin `container_name`**, para poder escalarlos (`docker compose up -d --scale
+  ms-gymflow-report=2`) y mostrar el rebalanceo de su consumer group. Una segunda instancia suma 384 MB: en
+  `ec2-apps` queda muy justo, así que la demo se hace un momento y se vuelve a `--scale ms-gymflow-report=1`.
+- **EP5: ningún health depende de Kafka.** Si `ec2-kafka` está apagada, reservations y catalog siguen respondiendo
+  (los eventos perdidos quedan en el log) y el BFF arranca igual.
 - **Variables obligatorias con `${VAR:?mensaje}`.** Si falta algo en el `.env`, `docker compose` se detiene
   con ese mensaje en vez de arrancar mal configurado.
 - **Dockerfiles** (en cada repo de servicio): compilan en dos etapas con el wrapper de Maven sobre
@@ -104,14 +114,15 @@ sudo usermod -aG docker ec2-user
 exit                           # salir y volver a entrar por ssh para que tome el grupo
 ```
 
-### 3. Clonar los 6 repos en `~/gymflow`
+### 3. Clonar los 9 repos en `~/gymflow`
 
 ```bash
 mkdir -p ~/gymflow && cd ~/gymflow
-for repo in infra ms-gymflow-bff ms-gymflow-catalog ms-gymflow-reservations ms-gymflow-notify ms-gymflow-mq-admin; do
-  git clone https://github.com/Lajerarquia/$repo.git
+for repo in infra ms-gymflow-bff ms-gymflow-catalog ms-gymflow-reservations ms-gymflow-notify ms-gymflow-mq-admin \
+            ms-gymflow-report ms-gymflow-audit ms-gymflow-kafka-admin; do
+  [ -d $repo ] || git clone https://github.com/Lajerarquia/$repo.git
 done
-ls ~/gymflow   # infra  ms-gymflow-bff  ms-gymflow-catalog  ms-gymflow-mq-admin  ms-gymflow-notify  ms-gymflow-reservations
+ls ~/gymflow
 ```
 
 Si los repos son privados, git pide usuario y un *personal access token* de GitHub (no la contraseña).
@@ -132,6 +143,8 @@ Completa:
 - `DB_PASSWORD`: la contraseña real de `postgres`. **Solo aquí**, nunca en un repo.
 - `RABBITMQ_ADDRESSES`, `RABBITMQ_MANAGEMENT_URL` y `RABBITMQ_PASSWORD` (EP2): IP privada de `ec2-mq` y la contraseña de
   `infra/mq/.env`. Ver [docs/rabbitmq.md](docs/rabbitmq.md).
+- `KAFKA_BOOTSTRAP_SERVERS` (EP5): IP privada de `ec2-kafka` con los puertos 9092, 9093 y 9094. Ver
+  [docs/kafka.md](docs/kafka.md), Parte E.
 - Lo demás (Azure, URLs internas, CORS) ya viene con los valores correctos.
 
 ### 5. Construir y levantar
@@ -140,17 +153,15 @@ Completa:
 cd ~/gymflow/infra/apps
 docker compose build           # la primera vez tarda varios minutos (descarga dependencias de Maven)
 docker compose up -d
-docker compose ps              # esperar a que los 5 digan "healthy" (hasta ~2 minutos)
+docker compose ps              # esperar a que los 8 digan "healthy" (hasta ~2 minutos)
 ```
 
-Si la compilación se queda sin memoria (las tres en paralelo), constrúyelas de a una:
+Si la compilación se queda sin memoria (varias en paralelo), constrúyelas de a una:
 
 ```bash
-docker compose build ms-gymflow-catalog
-docker compose build ms-gymflow-reservations
-docker compose build ms-gymflow-bff
-docker compose build ms-gymflow-notify
-docker compose build ms-gymflow-mq-admin
+for s in catalog reservations bff notify mq-admin report audit kafka-admin; do
+  docker compose build ms-gymflow-$s
+done
 docker compose up -d
 ```
 
@@ -191,7 +202,8 @@ docker run --rm -it postgres:17 psql "host=<endpoint-rds> dbname=gymflow user=po
 
 ```bash
 cd ~/gymflow
-for repo in infra ms-gymflow-bff ms-gymflow-catalog ms-gymflow-reservations ms-gymflow-notify ms-gymflow-mq-admin; do git -C $repo pull; done
+for repo in infra ms-gymflow-bff ms-gymflow-catalog ms-gymflow-reservations ms-gymflow-notify ms-gymflow-mq-admin \
+            ms-gymflow-report ms-gymflow-audit ms-gymflow-kafka-admin; do git -C $repo pull; done
 cd infra/apps && docker compose up -d --build
 ```
 

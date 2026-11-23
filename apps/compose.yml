@@ -1,14 +1,19 @@
-# GymFlow en la EC2 ec2-apps. Construye los 5 servicios desde los repos clonados al lado de infra/:
-#   ~/gymflow/infra/apps/compose.yml  →  ../../ms-gymflow-{bff,catalog,reservations,notify,mq-admin}
+# GymFlow en la EC2 ec2-apps. Construye los 8 servicios desde los repos clonados al lado de infra/:
+#   ~/gymflow/infra/apps/compose.yml  →  ../../ms-gymflow-{bff,catalog,reservations,notify,mq-admin,report,audit,kafka-admin}
 #
-# - Solo el BFF publica un puerto (8080). catalog, reservations, notify y mq-admin quedan en la red interna
-#   "gymflow": desde internet no se llega a ellos; el BFF los llama por el nombre del servicio.
-# - mq-admin se usa a través del BFF (/api/admin/mq/**, solo rol Admin), sin publicar su puerto.
+# - Solo el BFF publica un puerto (8080). Los demás quedan en la red interna "gymflow": desde internet no se llega
+#   a ellos; el BFF los llama por el nombre del servicio.
+# - mq-admin, report, audit y kafka-admin se usan a través del BFF (/api/admin/mq/**, /api/report/**, /api/audit/**,
+#   /api/admin/kafka/**), sin publicar sus puertos.
 # - RabbitMQ corre en otra EC2 (ec2-mq, infra/mq/compose.yml). reservations publica ahí y notify consume.
+# - EP5: Kafka corre en otra EC2 (ec2-kafka, infra/kafka/compose.yml). reservations y catalog publican;
+#   report (grupo gymflow-report) y audit (grupo gymflow-audit) consumen. Si Kafka no responde, la API sigue
+#   funcionando: los productores registran el error y ningún health depende de Kafka.
 # - Las variables salen de apps/.env (ignorado por git). Las obligatorias usan ${VAR:?mensaje}:
 #   si faltan, "docker compose up" se detiene con ese mensaje en vez de arrancar mal configurado.
-# - Memoria (t3.medium, 4 GB): 512 MB para bff, catalog y reservations; 384 MB para notify y mq-admin, que no tienen
-#   BD ni mucha carga. Total ~2,3 GB. La JVM respeta el límite del contenedor y usa el 70 % para el heap.
+# - Memoria (t3.medium, 4 GB): 512 MB para bff, catalog y reservations; 384 MB para notify, mq-admin, report y audit;
+#   320 MB para kafka-admin (sin BD, solo AdminClient). Total ~3,4 GB. La JVM respeta el límite del contenedor y usa
+#   el 70 % para el heap. Compilar las imágenes de a una (docker compose build <servicio>) si falta memoria.
 
 name: gymflow
 
@@ -41,6 +46,8 @@ services:
       DB_USERNAME: ${DB_USERNAME:?Falta DB_USERNAME en .env}
       DB_PASSWORD: ${DB_PASSWORD:?Falta DB_PASSWORD en .env}
       JPA_DDL_AUTO: ${JPA_DDL_AUTO:-update}
+      # EP5: publica en audit.timeline al crear, editar o eliminar clases y salas.
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:?Falta KAFKA_BOOTSTRAP_SERVERS en .env}
     expose: ["8082"]
     healthcheck:
       <<: *health
@@ -62,6 +69,8 @@ services:
       RABBITMQ_ADDRESSES: ${RABBITMQ_ADDRESSES:?Falta RABBITMQ_ADDRESSES en .env}
       RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:-gymflow}
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Falta RABBITMQ_PASSWORD en .env}
+      # EP5: publica cada cambio de estado en reservations.events y cada acción en audit.timeline.
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:?Falta KAFKA_BOOTSTRAP_SERVERS en .env}
     expose: ["8081"]
     depends_on:
       ms-gymflow-catalog:
@@ -85,6 +94,10 @@ services:
       # /api/admin/mq/** (solo Admin) se reenvía a mq-admin por la red interna. No depende de él para arrancar:
       # si mq-admin no está, esas rutas responden 503 y el resto de la API sigue funcionando.
       MQ_ADMIN_URL: ${MQ_ADMIN_URL:-http://ms-gymflow-mq-admin:8084}
+      # EP5: mismo criterio. Si report, audit o kafka-admin no están, sus rutas responden 503.
+      REPORT_URL: ${REPORT_URL:-http://ms-gymflow-report:8085}
+      AUDIT_URL: ${AUDIT_URL:-http://ms-gymflow-audit:8086}
+      KAFKA_ADMIN_URL: ${KAFKA_ADMIN_URL:-http://ms-gymflow-kafka-admin:8087}
     # El único puerto publicado en la EC2. Lo consume el API Gateway (security group gymflow-apps-sg: 8080).
     ports: ["8080:8080"]
     depends_on:
@@ -133,6 +146,65 @@ services:
     healthcheck:
       <<: *health
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8084 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+
+  # ---- EP5: Kafka ----
+
+  # Consumidor de reservations.events (grupo gymflow-report) y KPI en /api/report/** (vía BFF, Admin).
+  # Sin container_name a propósito: así se puede escalar para mostrar el rebalanceo del consumer group:
+  #   docker compose up -d --scale ms-gymflow-report=2      (cada instancia toma parte de las 3 particiones)
+  # Su health incluye RDS (tabla reserva_hecho), no Kafka.
+  ms-gymflow-report:
+    <<: *java
+    mem_limit: 384m
+    build: ../../ms-gymflow-report
+    image: gymflow/ms-gymflow-report:latest
+    environment:
+      <<: *java-env
+      DB_URL: ${DB_URL:?Falta DB_URL en .env}
+      DB_USERNAME: ${DB_USERNAME:?Falta DB_USERNAME en .env}
+      DB_PASSWORD: ${DB_PASSWORD:?Falta DB_PASSWORD en .env}
+      JPA_DDL_AUTO: ${JPA_DDL_AUTO:-update}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:?Falta KAFKA_BOOTSTRAP_SERVERS en .env}
+      REPORT_TIME_ZONE: ${REPORT_TIME_ZONE:-America/Santiago}
+    expose: ["8085"]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8085 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+
+  # Consumidor de audit.timeline (grupo gymflow-audit) y timeline en /api/audit/** (vía BFF, Admin y Auditor).
+  # Sin container_name por la misma razón que report (--scale ms-gymflow-audit=2).
+  ms-gymflow-audit:
+    <<: *java
+    mem_limit: 384m
+    build: ../../ms-gymflow-audit
+    image: gymflow/ms-gymflow-audit:latest
+    environment:
+      <<: *java-env
+      DB_URL: ${DB_URL:?Falta DB_URL en .env}
+      DB_USERNAME: ${DB_USERNAME:?Falta DB_USERNAME en .env}
+      DB_PASSWORD: ${DB_PASSWORD:?Falta DB_PASSWORD en .env}
+      JPA_DDL_AUTO: ${JPA_DDL_AUTO:-update}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:?Falta KAFKA_BOOTSTRAP_SERVERS en .env}
+    expose: ["8086"]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8086 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+
+  # Administración de Kafka (tópicos, configs, consumer groups) con AdminClient. Sin BD ni puertos publicados:
+  # se usa a través del BFF (/api/admin/kafka/**, solo Admin).
+  ms-gymflow-kafka-admin:
+    <<: *java
+    mem_limit: 320m
+    build: ../../ms-gymflow-kafka-admin
+    image: gymflow/ms-gymflow-kafka-admin:latest
+    container_name: ms-gymflow-kafka-admin
+    environment:
+      <<: *java-env
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:?Falta KAFKA_BOOTSTRAP_SERVERS en .env}
+    expose: ["8087"]
+    healthcheck:
+      <<: *health
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8087 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
 
 networks:
   gymflow:

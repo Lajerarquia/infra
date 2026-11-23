@@ -241,10 +241,15 @@ Justo después del reinicio todos los líderes quedan en `kafka1`; Kafka los red
 
 ## Parte E — Conectar los microservicios de `ec2-apps`
 
-(Se completa en las etapas siguientes de la EP5.) En `infra/apps/.env`:
+En `ec2-apps` corren los 3 servicios nuevos (report, audit y kafka-admin) junto a los anteriores; reservations y
+catalog ahora también publican en Kafka. En `infra/apps/.env` agrega (ver `.env.example`):
 
 ```
 KAFKA_BOOTSTRAP_SERVERS=<ip-privada-ec2-kafka>:9092,<ip-privada-ec2-kafka>:9093,<ip-privada-ec2-kafka>:9094
+REPORT_URL=http://ms-gymflow-report:8085
+AUDIT_URL=http://ms-gymflow-audit:8086
+KAFKA_ADMIN_URL=http://ms-gymflow-kafka-admin:8087
+REPORT_TIME_ZONE=America/Santiago
 ```
 
 Prueba de red desde `ec2-apps`, antes de levantar los servicios:
@@ -254,6 +259,35 @@ for p in 9092 9093 9094; do timeout 3 bash -c "</dev/tcp/<ip-privada-ec2-kafka>/
 ```
 
 Si sale CERRADO: revisa la regla 9092-9094 de `gymflow-kafka-sg` (origen `gymflow-apps-sg`) y que ambas EC2 estén en la misma VPC.
+
+Clonar los repos nuevos, compilar de a uno (memoria) y levantar:
+
+```bash
+cd ~/gymflow
+for repo in ms-gymflow-report ms-gymflow-audit ms-gymflow-kafka-admin; do
+  [ -d $repo ] || git clone https://github.com/Lajerarquia/$repo.git
+done
+for repo in infra ms-gymflow-bff ms-gymflow-catalog ms-gymflow-reservations; do git -C $repo pull; done
+cd infra/apps
+for s in catalog reservations bff report audit kafka-admin; do docker compose build ms-gymflow-$s; done
+docker compose up -d
+docker compose ps                     # los 8 en "healthy"
+docker stats --no-stream              # memoria: ~3,4 GB de 4 GB en total
+```
+
+Comprobar que los consumidores se unieron a sus grupos:
+
+```bash
+docker compose logs ms-gymflow-report | grep -i "partitions assigned"
+docker compose logs ms-gymflow-audit  | grep -i "partitions assigned"
+```
+
+Y en Kafka UI → Consumers: `gymflow-report` y `gymflow-audit` en estado STABLE, con 3 miembros cada uno
+(`concurrency: 3`, un hilo por partición).
+
+Demo de rebalanceo (indicador 8): `docker compose up -d --scale ms-gymflow-report=2` → en Kafka UI el grupo pasa a
+6 miembros (3 tienen partición y 3 quedan en espera: no hay más particiones que repartir). Volver con
+`--scale ms-gymflow-report=1` (cuidar la memoria).
 
 ## Probar en local (Docker Desktop)
 
